@@ -7,6 +7,7 @@ from typing import Any, Optional
 
 from fastapi import HTTPException, status
 
+from . import attestation
 from .evaluation import evaluate
 from .cross_window import CrossWindowError, build_cross_window_review
 from .models import (
@@ -16,6 +17,9 @@ from .models import (
     HANDOVER_STATUS_LABELS_ZH,
     HANDOVER_VALID,
     READING_VOIDED,
+    SEAL_SEALED,
+    SEAL_STATUS_LABELS_ZH,
+    SEAL_UNSEALED,
     VERDICT_LABELS_ZH,
     Verdict,
 )
@@ -30,6 +34,8 @@ from .schemas import (
     ReadingVoidSubmit,
     RuleRevisionSubmit,
     WindowCreate,
+    WindowSealSubmit,
+    WindowUnsealSubmit,
 )
 from .timeutils import parse_stored, to_iso, to_utc
 
@@ -101,6 +107,38 @@ def get_window_row(conn: sqlite3.Connection, window_id: int) -> sqlite3.Row:
     return row
 
 
+def get_active_seal_row(
+    conn: sqlite3.Connection, window_id: int
+) -> Optional[sqlite3.Row]:
+    """窗口当前封存记录（status='sealed'）；无封存（含已解封）返回 None。
+
+    不变式：每窗口至多一条 sealed 行（封存服务与解封服务共同保证）。
+    """
+    return conn.execute(
+        "SELECT * FROM window_seals WHERE window_id=? AND status=? "
+        "ORDER BY id DESC LIMIT 1",
+        (window_id, SEAL_SEALED),
+    ).fetchone()
+
+
+def assert_window_not_sealed(conn: sqlite3.Connection, window_id: int, action: str) -> None:
+    """封存期间该窗口写操作一律 409 拒绝（查询、核验与证书撤销不受影响）。
+
+    `action` 为该写操作的中文名，用于错误提示。幂等重放同样拒绝：封存语义
+    是“冻结窗口”，任何提交类操作在解封前都不改变状态。
+    """
+    seal = get_active_seal_row(conn, window_id)
+    if seal is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"窗口 {window_id} 已封存（封存编号 {seal['id']}，"
+                f"封存原因「{seal['seal_reason']}」），封存期间拒绝{action}；"
+                "如需更正请先凭封存编号与非空原因解封。"
+            ),
+        )
+
+
 def list_windows(conn: sqlite3.Connection, limit: int = 100, offset: int = 0) -> list[dict[str, Any]]:
     rows = conn.execute(
         "SELECT * FROM windows ORDER BY id DESC LIMIT ? OFFSET ?", (limit, offset)
@@ -126,6 +164,7 @@ def submit_reading(
 ) -> tuple[str, dict[str, Any]]:
     """提交/修订读数，返回 (effect, reading_dict)。调用方需已持有写事务。"""
     win = get_window_row(conn, window_id)
+    assert_window_not_sealed(conn, window_id, "读数提交")
     win_start = parse_stored(win["start_at"])
     win_end = parse_stored(win["end_at"])
 
@@ -291,6 +330,7 @@ def submit_reading_batch(
     - 校验全部通过后一次提交全部变化。
     """
     win = get_window_row(conn, window_id)
+    assert_window_not_sealed(conn, window_id, "读数批量补传")
     win_start = parse_stored(win["start_at"])
     win_end = parse_stored(win["end_at"])
 
@@ -536,6 +576,7 @@ def void_reading(
     - 相同修订号原因不同、修订号不高于当前 -> 409；
     - 读数从未存在 -> 404；已作废的读数不能再次以新修订号作废 -> 409。
     """
+    assert_window_not_sealed(conn, window_id, "读数作废")
     active = conn.execute(
         "SELECT * FROM readings WHERE window_id=? AND reading_id=?",
         (window_id, reading_id),
@@ -744,6 +785,7 @@ def register_fault_period(
     - 非法时段 -> 422；窗口不存在 -> 404（先于内容校验）。
     """
     win = get_window_row(conn, window_id)
+    assert_window_not_sealed(conn, window_id, "故障时段登记")
     win_start = parse_stored(win["start_at"])
     win_end = parse_stored(win["end_at"])
 
@@ -813,6 +855,7 @@ def withdraw_fault_period(
     """
     # 先确认窗口存在，使“窗口不存在”与“标识未找到”语义可区分
     get_window_row(conn, window_id)
+    assert_window_not_sealed(conn, window_id, "故障时段撤回")
     row = get_fault_row_or_404(conn, window_id, fault_id)
 
     if row["status"] == FAULT_WITHDRAWN:
@@ -873,6 +916,8 @@ def window_to_dict(conn: sqlite3.Connection, row: sqlite3.Row) -> dict[str, Any]
     ).fetchone()
     # 当前可用证书：仅最新签发版本未撤销时存在（撤销最新版不自动退回旧版）
     current = get_current_certificate_row(conn, row["id"])
+    # 封存状态：封存中该窗口只读（每窗口至多一条 sealed 记录）
+    active_seal = get_active_seal_row(conn, row["id"])
     return {
         "id": row["id"],
         "name": row["name"],
@@ -889,6 +934,8 @@ def window_to_dict(conn: sqlite3.Connection, row: sqlite3.Row) -> dict[str, Any]
         "current_certificate_id": current["id"] if current else None,
         "current_certificate_version": current["version"] if current else None,
         "current_verdict": current["verdict"] if current else None,
+        "sealed": active_seal is not None,
+        "active_seal_id": active_seal["id"] if active_seal is not None else None,
     }
 
 
@@ -1000,6 +1047,7 @@ def revise_window_rules(
     new_values = _rule_values_from_payload(payload)
     # 窗口不存在 -> 404（先于一切校验）
     win_row = get_window_row(conn, window_id)
+    assert_window_not_sealed(conn, window_id, "规则修订")
     # 跨字段校验（Pydantic 单字段校验之外）：下限不大于上限
     if new_values["allowed_temp_min"] > new_values["allowed_temp_max"]:
         raise HTTPException(
@@ -1120,26 +1168,18 @@ def list_rule_revisions(conn: sqlite3.Connection, window_id: int) -> list[dict[s
 
 # ---------------------------------------------------------------- 签发
 
-def issue_certificate(
-    conn: sqlite3.Connection, window_id: int, note: Optional[str]
-) -> dict[str, Any]:
-    """签发证书：在当前写事务内读取同一已提交状态并固化快照。
+def build_current_snapshot(conn: sqlite3.Connection, win: sqlite3.Row) -> dict[str, Any]:
+    """按当前已提交状态构建证书快照（窗口参数 + 规则修订号 + 审定结果 +
+    全部活动读数 + 有效（未撤回）仪器故障时段）。
 
-    每次签发 version 自增；修订后再次签发形成新版本，旧版本原样保留。
+    签发用它固化不可变快照；封存用它与所见证书快照逐部分比对一致性。
     """
-    win = get_window_row(conn, window_id)
     evaluation = compute_evaluation(conn, win)
-    reading_rows = list_active_readings(conn, window_id)
-    # 固化签发时的有效（未撤回）仪器故障时段（取并集遮蔽所用的原始登记；
-    # 跨证报告从各自快照还原故障造成的时间线变化）。已撤回时段不进快照。
-    fault_rows = list_active_fault_period_rows(conn, window_id)
-
-    last = conn.execute(
-        "SELECT MAX(version) AS v FROM certificates WHERE window_id=?", (window_id,)
-    ).fetchone()
-    version = (last["v"] or 0) + 1
-
-    snapshot = {
+    reading_rows = list_active_readings(conn, win["id"])
+    # 固化当前有效（未撤回）仪器故障时段（取并集遮蔽所用的原始登记）；
+    # 已撤回时段不进快照。
+    fault_rows = list_active_fault_period_rows(conn, win["id"])
+    return {
         "window": {
             "id": win["id"],
             "name": win["name"],
@@ -1149,19 +1189,37 @@ def issue_certificate(
             "allowed_temp_max": win["allowed_temp_max"],
             "max_continuous_exceed_seconds": win["max_continuous_exceed_seconds"],
             "max_sample_interval_seconds": win["max_sample_interval_seconds"],
-            "rule_revision": _current_rule_revision_number(conn, window_id),
+            "rule_revision": _current_rule_revision_number(conn, win["id"]),
         },
         "evaluation": evaluation,
         "readings": [reading_to_dict(r) for r in reading_rows],
         "fault_periods": [fault_period_to_dict(r) for r in fault_rows],
     }
 
+
+def issue_certificate(
+    conn: sqlite3.Connection, window_id: int, note: Optional[str]
+) -> dict[str, Any]:
+    """签发证书：在当前写事务内读取同一已提交状态并固化快照。
+
+    每次签发 version 自增；修订后再次签发形成新版本，旧版本原样保留。
+    """
+    win = get_window_row(conn, window_id)
+    assert_window_not_sealed(conn, window_id, "新证书签发")
+    snapshot = build_current_snapshot(conn, win)
+
+    last = conn.execute(
+        "SELECT MAX(version) AS v FROM certificates WHERE window_id=?", (window_id,)
+    ).fetchone()
+    version = (last["v"] or 0) + 1
+
     cur = conn.execute(
         """
         INSERT INTO certificates (window_id, version, verdict, snapshot_json, note)
         VALUES (?, ?, ?, ?, ?)
         """,
-        (window_id, version, evaluation["verdict"], json.dumps(snapshot, ensure_ascii=False), note),
+        (window_id, version, snapshot["evaluation"]["verdict"],
+         json.dumps(snapshot, ensure_ascii=False), note),
     )
     return get_certificate(conn, int(cur.lastrowid))
 
@@ -1553,3 +1611,248 @@ def handover_order_to_dict(
         "created_at": order_row["created_at"],
         "items": item_dicts,
     }
+
+
+# ---------------------------------------------------------------- 窗口封存 / 解封
+
+# 封存证据中与当前状态逐一核对的快照部分（封存要求与当前状态一致）
+_SEAL_SNAPSHOT_PARTS = (
+    ("window", "规则（窗口参数与规则修订号）"),
+    ("evaluation", "审定结果"),
+    ("readings", "活动读数"),
+    ("fault_periods", "有效故障时段"),
+)
+
+
+def _seal_row_or_404(conn: sqlite3.Connection, seal_id: int) -> sqlite3.Row:
+    row = conn.execute(
+        "SELECT * FROM window_seals WHERE id=?", (seal_id,)
+    ).fetchone()
+    if row is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"封存编号 {seal_id} 不存在",
+        )
+    return row
+
+
+def seal_window(
+    conn: sqlite3.Connection, window_id: int, payload: WindowSealSubmit
+) -> tuple[str, dict[str, Any]]:
+    """封存窗口，返回 (effect, seal_dict)。调用方需已持有写事务。
+
+    封存须在同一写事务内确认：
+    - 窗口存在（404）、当前未封存（已封存见幂等/冲突规则）；
+    - 所见证书存在（404）、属于该窗口（422）、仍为该窗口最新签发且未撤销
+      版本（409）；
+    - 证书不可变快照中的规则、活动读数、有效故障时段和审定结果与当前状态
+      完全一致（任一不符 409，拒绝且不留记录）。
+    封存期间同证书同原因重试 -> ("idempotent", 原封存记录)；同证书异原因或
+    异证书 -> 409。证据（快照副本 + SHA-256 摘要）一经写入不再修改。
+    """
+    win = get_window_row(conn, window_id)
+
+    # 所见证书：存在性 -> 404；归属窗口 -> 422（先于封存冲突校验）
+    cert_row = conn.execute(
+        "SELECT * FROM certificates WHERE id=?", (payload.certificate_id,)
+    ).fetchone()
+    if cert_row is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"证书 {payload.certificate_id} 不存在，无法封存窗口 {window_id}",
+        )
+    if cert_row["window_id"] != window_id:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                f"证书 {payload.certificate_id} 不属于窗口 {window_id}"
+                f"（其属于窗口 {cert_row['window_id']}），拒绝封存："
+                "封存请求的窗口标识与证书所属窗口必须一致。"
+            ),
+        )
+
+    # 已封存：同证书同因幂等返回原记录；其它内容冲突
+    existing = get_active_seal_row(conn, window_id)
+    if existing is not None:
+        if (existing["certificate_id"] == payload.certificate_id
+                and existing["seal_reason"] == payload.reason):
+            return "idempotent", seal_to_dict(conn, existing, include_certificate=True)
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"窗口 {window_id} 已封存（封存编号 {existing['id']}，"
+                f"锁定证书 {existing['certificate_id']}，封存原因「{existing['seal_reason']}」）："
+                f"本次（证书 {payload.certificate_id}，原因「{payload.reason}」）"
+                "与现存封存不一致。封存期间同证书同原因重试为幂等，异内容冲突；"
+                "如需更正请先凭封存编号与非空原因解封。"
+            ),
+        )
+
+    # 证书仍为最新未撤销版本（当前可用证书）
+    current_row = get_current_certificate_row(conn, window_id)
+    if current_row is None or current_row["id"] != cert_row["id"]:
+        latest = conn.execute(
+            "SELECT id, version FROM certificates WHERE window_id=? ORDER BY version DESC LIMIT 1",
+            (window_id,),
+        ).fetchone()
+        if cert_row["revoked_reason"] is not None:
+            why = "该证书已撤销"
+        elif latest is not None and latest["id"] != cert_row["id"]:
+            why = f"该证书已被更新版本（版本 {latest['version']}）替代"
+        else:
+            why = "该证书不是窗口当前可用证书"
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"拒绝封存窗口 {window_id}：证书 {payload.certificate_id} 不是该窗口"
+                f"最新未撤销版本（{why}；撤销最新版不自动退回旧版）。"
+                "只能凭窗口当前可用证书封存。"
+            ),
+        )
+
+    # 不可变快照与当前状态逐部分核对：规则/活动读数/有效故障时段/审定结果
+    snapshot = json.loads(cert_row["snapshot_json"])
+    current_snapshot = build_current_snapshot(conn, win)
+    mismatches: list[str] = []
+    for key, label in _SEAL_SNAPSHOT_PARTS:
+        sealed_part = snapshot.get(key)
+        # 旧快照缺字段按空/缺省解读，避免直接比较键存在性造成误判
+        current_part = current_snapshot[key]
+        if key == "window":
+            # 旧快照窗口部分可能无 rule_revision（按第 1 版解读）
+            sealed_part = {**(sealed_part or {})}
+            sealed_part.setdefault("rule_revision", 1)
+        elif key == "fault_periods" and sealed_part is None:
+            sealed_part = []
+        if attestation.canonical_dumps(sealed_part) != attestation.canonical_dumps(current_part):
+            mismatches.append(label)
+    if mismatches:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"拒绝封存窗口 {window_id}：证书 {payload.certificate_id} 的不可变快照"
+                f"与当前状态不一致（差异部分：{'、'.join(mismatches)}）。"
+                "封存只接受快照（规则、活动读数、有效故障时段与审定结果）"
+                "与当前状态完全一致的当前可用证书；请先按当前状态签发新证书。"
+            ),
+        )
+
+    # 封存：固化证据快照副本与摘要（证据列此后不再更新）
+    digest = attestation.snapshot_digest(snapshot)
+    cur = conn.execute(
+        """
+        INSERT INTO window_seals (window_id, certificate_id, seal_reason,
+                                  evidence_snapshot_json, evidence_digest, status)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (window_id, cert_row["id"], payload.reason,
+         cert_row["snapshot_json"], digest, SEAL_SEALED),
+    )
+    row = conn.execute(
+        "SELECT * FROM window_seals WHERE id=?", (cur.lastrowid,)
+    ).fetchone()
+    return "sealed", seal_to_dict(conn, row, include_certificate=True)
+
+
+def unseal_window(
+    conn: sqlite3.Connection, seal_id: int, payload: WindowUnsealSubmit
+) -> tuple[str, dict[str, Any]]:
+    """解封窗口，返回 (effect, seal_dict)。调用方需已持有写事务。
+
+    - 封存编号不存在 -> 404；
+    - 已解封且解封原因相同 -> ("idempotent", 原记录)，解封时间不变；
+    - 已解封但原因不同 -> 409；
+    - 解封只置状态（固化解封原因与时间），证据行保留；解封后可按原流程
+      更正并再次封存（形成新记录）。
+    """
+    row = _seal_row_or_404(conn, seal_id)
+    if row["status"] == SEAL_UNSEALED:
+        if payload.reason != row["unseal_reason"]:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    f"封存编号 {seal_id} 已解封且解封原因冲突："
+                    f"已存「{row['unseal_reason']}」，本次「{payload.reason}」。"
+                    "重复解封必须使用相同原因（相同原因重放为幂等，返回原记录）。"
+                ),
+            )
+        return "idempotent", seal_to_dict(conn, row, include_certificate=True)
+
+    conn.execute(
+        "UPDATE window_seals SET status=?, unseal_reason=?, "
+        "unsealed_at=strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id=?",
+        (SEAL_UNSEALED, payload.reason, seal_id),
+    )
+    row = conn.execute("SELECT * FROM window_seals WHERE id=?", (seal_id,)).fetchone()
+    return "unsealed", seal_to_dict(conn, row, include_certificate=True)
+
+
+def get_seal(conn: sqlite3.Connection, seal_id: int) -> dict[str, Any]:
+    return seal_to_dict(conn, _seal_row_or_404(conn, seal_id), include_certificate=True)
+
+
+def list_window_seals(
+    conn: sqlite3.Connection, window_id: int
+) -> list[dict[str, Any]]:
+    """窗口全部封存记录（含已解封），按封存编号升序。列表不含证书完整对象。"""
+    get_window_row(conn, window_id)
+    rows = conn.execute(
+        "SELECT * FROM window_seals WHERE window_id=? ORDER BY id ASC",
+        (window_id,),
+    ).fetchall()
+    return [seal_to_dict(conn, r, include_certificate=False) for r in rows]
+
+
+def seal_to_dict(
+    conn: sqlite3.Connection, row: sqlite3.Row, include_certificate: bool
+) -> dict[str, Any]:
+    """封存行 -> API 输出。
+
+    evidence 为封存时固化的证书快照副本与摘要，封存/解封/证书撤销都不改它；
+    certificate（仅详情/操作响应给出）与 certificate_current_now 反映查询时刻
+    引用证书的当前状态——封存证书后来被撤销或被新版本替代时，
+    certificate_current_now=false，但证据内容不变。
+    """
+    snapshot = json.loads(row["evidence_snapshot_json"])
+    # 证书版本号/结论不进快照，取存根行（证书永不删除；外键保证行存在）
+    cert_row = conn.execute(
+        "SELECT version, verdict FROM certificates WHERE id=?",
+        (row["certificate_id"],),
+    ).fetchone()
+    data: dict[str, Any] = {
+        "id": row["id"],
+        "window_id": row["window_id"],
+        "reason": row["seal_reason"],
+        "status": row["status"],
+        "status_label_zh": SEAL_STATUS_LABELS_ZH[row["status"]],
+        "sealed_at": row["sealed_at"],
+        "unseal": (
+            {"reason": row["unseal_reason"], "unsealed_at": row["unsealed_at"]}
+            if row["status"] == SEAL_UNSEALED else None
+        ),
+        "evidence": {
+            "certificate_id": row["certificate_id"],
+            "certificate_version": cert_row["version"] if cert_row is not None else None,
+            "verdict": cert_row["verdict"] if cert_row is not None else None,
+            "snapshot": snapshot,
+            "snapshot_digest": row["evidence_digest"],
+            "snapshot_digest_algorithm": "SHA-256",
+        },
+    }
+
+    if include_certificate and cert_row is not None:
+        full_cert = get_certificate(conn, row["certificate_id"])
+        data["certificate"] = full_cert
+        latest = conn.execute(
+            "SELECT id FROM certificates WHERE window_id=? ORDER BY version DESC LIMIT 1",
+            (row["window_id"],),
+        ).fetchone()
+        is_current = (
+            latest is not None and latest["id"] == row["certificate_id"]
+            and not full_cert["revoked"]
+        )
+        data["certificate_current_now"] = is_current
+    else:
+        data["certificate"] = None
+        data["certificate_current_now"] = None
+    return data

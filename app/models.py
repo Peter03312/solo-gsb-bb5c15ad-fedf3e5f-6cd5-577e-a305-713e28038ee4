@@ -50,3 +50,13 @@ HANDOVER_STATUS_LABELS_ZH = {
     HANDOVER_VALID: "有效",
     HANDOVER_INVALID: "失效",
 }
+
+# 窗口封存状态：封存（sealed）期间该窗口只读（原查询/核验与证书撤销照常可用）；
+# 凭封存编号 + 非空原因解封（unsealed），只置状态并留痕，证据行保留；
+# 已解封窗口可再次封存并形成新记录。
+SEAL_SEALED = "sealed"
+SEAL_UNSEALED = "unsealed"
+SEAL_STATUS_LABELS_ZH = {
+    SEAL_SEALED: "封存中",
+    SEAL_UNSEALED: "已解封",
+}

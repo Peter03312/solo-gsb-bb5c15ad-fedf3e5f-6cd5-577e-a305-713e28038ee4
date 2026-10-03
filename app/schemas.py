@@ -386,6 +386,9 @@ class WindowOut(BaseModel):
         None, description="窗口详情中给出的当前可用证书完整内容（列表端点不返回）；无则为 null")
     active_fault_periods: Optional[list[FaultPeriodOut]] = Field(
         None, description="窗口详情中给出当前有效（未撤回）仪器故障时段（按起点升序）；列表端点不返回")
+    sealed: bool = Field(False, description="该窗口当前是否处于封存中（封存期间窗口只读，写操作拒绝）")
+    active_seal_id: Optional[int] = Field(
+        None, description="当前封存记录编号（封存中）；无封存或已解封时为 null")
 
 
 class ReadingSubmitResponse(BaseModel):
@@ -882,6 +885,101 @@ class KeyRotateResponse(BaseModel):
 class KeyListResponse(BaseModel):
     active: Optional[SigningKeyOut] = Field(None, description="当前用于新包签名的 active 密钥；无则为 null")
     keys: list[SigningKeyOut] = Field(..., description="全部保留签名密钥（含 retired 历史公钥），新→旧")
+
+
+# ------------------------------------------------------------ 窗口封存 / 解封
+
+class WindowSealSubmit(BaseModel):
+    """馆员封存一个已完成审定的窗口：凭所见当前证书标识 + 非空原因。
+
+    - certificate_id 必须是该窗口最新签发且未撤销的证书（当前可用证书），
+      且其不可变快照中的规则、活动读数、有效故障时段与审定结果必须与当前
+      状态一致；任一不符 -> 409，拒绝且不留记录；证书不存在 -> 404；
+    - 封存期间该窗口拒绝读数提交/批量补传/作废、故障登记/撤回、规则修订
+      及新证书签发（409）；原查询、核验与证书撤销照常可用；
+    - 封存期间同证书同原因重试 -> 幂等返回原封存记录；同证书异原因（或
+      异证书）-> 409 内容冲突；原因为空或只含空白 -> 422。
+    """
+
+    certificate_id: int = Field(..., ge=1, description="馆员所见当前可用证书标识（须仍为该窗口最新未撤销版本）")
+    reason: str = Field(..., min_length=1, max_length=500,
+                        description="封存原因（非空，不能只含空白字符）")
+
+    @field_validator("reason")
+    @classmethod
+    def _non_blank(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("封存原因不能为空（不能只含空白字符）")
+        return v
+
+
+class WindowUnsealSubmit(BaseModel):
+    """解封一个封存中的窗口：凭非空解封原因（封存编号在路径中给出）。
+
+    - 相同原因重复解封 -> 幂等返回原封存记录（解封时间不变）；
+      已解封但原因不同 -> 409；封存编号不存在 -> 404；
+    - 原因为空或只含空白 -> 422。
+    """
+
+    reason: str = Field(..., min_length=1, max_length=500,
+                        description="解封原因（非空，不能只含空白字符）")
+
+    @field_validator("reason")
+    @classmethod
+    def _non_blank(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("解封原因不能为空（不能只含空白字符）")
+        return v
+
+
+class SealUnsealInfoOut(BaseModel):
+    """解封信息：封存中为 null。"""
+
+    reason: str = Field(..., description="解封原因")
+    unsealed_at: str = Field(..., description="解封操作时间（UTC）")
+
+
+class SealEvidenceOut(BaseModel):
+    """封存证据：证据内容封存后不可改。"""
+
+    certificate_id: int = Field(..., description="封存时锁定的证书标识")
+    certificate_version: int = Field(..., description="封存时锁定的证书版本")
+    verdict: str = Field(..., description="封存时锁定的审定结论")
+    snapshot: dict[str, Any] = Field(
+        ..., description="封存时固化的证书不可变快照副本（规则/活动读数/有效故障时段/审定结果；此后不改）")
+    snapshot_digest: str = Field(..., description="证据快照 SHA-256 小写十六进制摘要")
+    snapshot_digest_algorithm: str = Field("SHA-256", description="摘要算法（固定 SHA-256）")
+
+
+class WindowSealOut(BaseModel):
+    """一条窗口封存记录（封存证据不可改；解封只置状态并留痕）。"""
+
+    id: int = Field(..., description="封存编号（解封/查询/重放均凭此编号）")
+    window_id: int
+    reason: str = Field(..., description="封存原因")
+    status: str = Field(..., description="sealed | unsealed")
+    status_label_zh: str = Field(..., description="封存中 | 已解封")
+    sealed_at: str = Field(..., description="封存时间（UTC）")
+    unseal: Optional[SealUnsealInfoOut] = Field(
+        None, description="解封信息（解封原因与时间）；封存中为 null")
+    evidence: SealEvidenceOut = Field(..., description="封存证据（封存后不可改）")
+    certificate: Optional[CertificateOut] = Field(
+        None,
+        description="查询时刻的引用证书当前状态（含 revoked 标示；列表端点不返回，证据字段始终不变）")
+    certificate_current_now: Optional[bool] = Field(
+        None,
+        description="查询时刻该证书是否仍为所属窗口最新未撤销版本；"
+                    "证书被撤销或被新版本替代时为 false，但封存证据不变")
+
+
+class WindowSealResponse(BaseModel):
+    effect: str = Field(..., description="sealed | idempotent")
+    seal: WindowSealOut
+
+
+class WindowUnsealResponse(BaseModel):
+    effect: str = Field(..., description="unsealed | idempotent")
+    seal: WindowSealOut
 
 
 # WindowOut.current_certificate 前向引用了后文定义的 CertificateOut，

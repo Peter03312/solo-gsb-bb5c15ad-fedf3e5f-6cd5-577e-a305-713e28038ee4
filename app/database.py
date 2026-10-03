@@ -158,6 +158,30 @@ CREATE TABLE IF NOT EXISTS fault_periods (
 CREATE INDEX IF NOT EXISTS idx_fault_periods_window
     ON fault_periods(window_id, status, start_at, end_at);
 
+-- 窗口封存：馆员完成窗口审定后，凭窗口标识、所见当前证书标识与非空原因封存。
+-- 封存须在同一写事务确认该证书仍为最新未撤销版本，且其不可变快照中的规则、
+-- 活动读数、有效故障时段和审定结果与当前状态一致；不符则拒绝且不留记录。
+-- 证据（证书不可变快照副本 + SHA-256 摘要）一经写入永不修改；封存期间拒绝
+-- 该窗口的读数提交/批量补传/作废、故障登记/撤回、规则修订与新证书签发。
+-- 凭封存编号 + 非空原因解封：只置状态并固化解封原因/时间，证据行保留；
+-- 已解封窗口可再次封存，形成新记录（每窗口至多一条 status='sealed' 记录）。
+CREATE TABLE IF NOT EXISTS window_seals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    window_id INTEGER NOT NULL REFERENCES windows(id),
+    certificate_id INTEGER NOT NULL REFERENCES certificates(id),
+    seal_reason TEXT NOT NULL,                -- 封存原因（非空）
+    evidence_snapshot_json TEXT NOT NULL,     -- 证据：封存时证书不可变快照副本（此后不改）
+    evidence_digest TEXT NOT NULL,            -- 证据快照 SHA-256（小写十六进制）
+    status TEXT NOT NULL DEFAULT 'sealed',    -- sealed | unsealed
+    unseal_reason TEXT,                       -- 解封原因（仅 unsealed 行）
+    unsealed_at TEXT,                         -- 解封操作时间（仅 unsealed 行）
+    sealed_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_window_seals_window
+    ON window_seals(window_id, id);
+
 -- 证书核验包本地签名密钥：Ed25519，私钥仅保存在馆方本地库内。
 -- 任意时刻至多一把 status='active' 密钥用于新包签名；轮换把旧密钥置为
 -- retired（保留历史公钥），旧包仍可凭其公钥核验。服务首次启动或首次

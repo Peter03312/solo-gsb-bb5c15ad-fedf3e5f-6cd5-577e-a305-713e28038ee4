@@ -561,3 +561,77 @@ echo "-- 19.10 证书不存在出包 -> 404；包格式不受支持 -> 422（无
 api POST /api/v1/certificates/99999/verification-package || true
 echo "$BUNDLE" | python3 -c "import sys,json;p=json.load(sys.stdin);p['format']='bad/format';print(json.dumps(p,ensure_ascii=False))" \
   | { read -r BADFMT; api POST /api/v1/verification-packages/verify "$BADFMT"; } || true
+
+echo "== 20. 窗口封存与解封（完成审定后凭当前证书封存；封存证据不可改，封存期间窗口只读）=="
+
+# 单独建一个满覆盖合格窗口并签发
+SIDW=$(api POST /api/v1/windows '{
+  "name":"封存演示窗","start_at":"2026-10-01T00:00:00Z","end_at":"2026-10-01T01:00:00Z",
+  "allowed_temp_min":18,"allowed_temp_max":22,
+  "max_continuous_exceed_seconds":300,"max_sample_interval_seconds":600}' \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')
+for ITEM in 'a 00' 'b 10' 'c 20' 'd 30' 'e 40' 'f 50'; do
+  set -- $ITEM
+  api POST "/api/v1/windows/$SIDW/readings" "{\"reading_id\":\"$1\",\"revision\":1,\"measured_at\":\"2026-10-01T00:$2:00Z\",\"temperature\":20.0}" >/dev/null
+done
+api POST "/api/v1/windows/$SIDW/readings" '{"reading_id":"g","revision":1,"measured_at":"2026-10-01T01:00:00Z","temperature":20.0}' >/dev/null
+SCID=$(api POST "/api/v1/windows/$SIDW/certificates/issue" '{"note":"封存前签发"}' \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')
+echo "窗口 $SIDW 当前可用证书 $SCID"
+
+echo "-- 20.1 封存：窗口标识 + 所见当前证书标识 + 非空原因；同一写事务核对证书最新未撤销且快照与当前状态一致 --"
+SEAL=$(api POST "/api/v1/windows/$SIDW/seals" "{\"certificate_id\":$SCID,\"reason\":\"窗口审定完成：证据封存归档\"}")
+echo "$SEAL" | python3 -c 'import sys,json;s=json.load(sys.stdin)["seal"];print("effect: sealed");print("封存编号:",s["id"],"状态:",s["status_label_zh"],"封存时间:",s["sealed_at"]);print("证据: 证书",s["evidence"]["certificate_id"],"v"+str(s["evidence"]["certificate_version"]),s["evidence"]["verdict"],"摘要",s["evidence"]["snapshot_digest"][:16]+"...");print("引用证书当前可用:",s["certificate_current_now"])'
+SEAL_ID=$(echo "$SEAL" | python3 -c 'import sys,json;print(json.load(sys.stdin)["seal"]["id"])')
+DIGEST1=$(echo "$SEAL" | python3 -c 'import sys,json;print(json.load(sys.stdin)["seal"]["evidence"]["snapshot_digest"])')
+
+echo "-- 20.2 封存期间写操作一律 409（读数提交/批量补传/作废/故障登记/撤回/规则修订/新证书签发）--"
+api POST "/api/v1/windows/$SIDW/readings" '{"reading_id":"x","revision":1,"measured_at":"2026-10-01T00:05:00Z","temperature":20.0}' || true
+api POST "/api/v1/windows/$SIDW/readings/batch" '{"readings":[{"reading_id":"x","revision":1,"measured_at":"2026-10-01T00:05:00Z","temperature":20.0}]}' || true
+api POST "/api/v1/windows/$SIDW/readings/a/void" '{"revision":9,"reason":"封存期作废"}' || true
+api POST "/api/v1/windows/$SIDW/fault-periods" '{"fault_id":"fx","start_at":"2026-10-01T00:05:00Z","end_at":"2026-10-01T00:06:00Z","reason":"封存期故障"}' || true
+api POST "/api/v1/windows/$SIDW/fault-periods/fx/withdrawal" '{"reason":"封存期撤回"}' || true
+api POST "/api/v1/windows/$SIDW/rule-revisions" '{"revision":2,"allowed_temp_min":18,"allowed_temp_max":21,"max_continuous_exceed_seconds":300,"max_sample_interval_seconds":600,"reason":"封存期改规则"}' || true
+api POST "/api/v1/windows/$SIDW/certificates/issue" '{"note":"封存期签发"}' || true
+
+echo "-- 20.3 原查询、核验照常；证书撤销在封存期间也允许 --"
+api GET "/api/v1/windows/$SIDW" \
+  | python3 -c 'import sys,json;d=json.load(sys.stdin);print("窗口详情 sealed:",d["sealed"],"active_seal_id:",d["active_seal_id"])'
+api GET "/api/v1/windows/$SIDW/evaluation" | python3 -c 'import sys,json;print("审定查询仍可用:",json.load(sys.stdin)["verdict"])'
+api POST "/api/v1/certificates/$SCID/verification-package" \
+  | python3 -c 'import sys,json;print("核验包出具仍可用: 摘要",json.load(sys.stdin)["snapshot_digest"][:12]+"...")'
+api POST "/api/v1/certificates/$SCID/revocation" '{"reason":"封存后复核发现签发依据有误"}' >/dev/null
+api GET "/api/v1/window-seals/$SEAL_ID" | python3 -c 'import sys,json;d=json.load(sys.stdin);print("撤销后引用证书状态: revoked =",d["certificate"]["revoked"],"当前可用 =",d["certificate_current_now"]);print("封存证据不变: 摘要",d["evidence"]["snapshot_digest"][:16]+"...")'
+
+echo "-- 20.4 封存重试：同证书同原因幂等；异原因 409（撤销后也不能改证据）--"
+api POST "/api/v1/windows/$SIDW/seals" "{\"certificate_id\":$SCID,\"reason\":\"窗口审定完成：证据封存归档\"}" \
+  | python3 -c 'import sys,json;d=json.load(sys.stdin);print("同内容重试:",d["effect"],"编号仍为",d["seal"]["id"])'
+api POST "/api/v1/windows/$SIDW/seals" "{\"certificate_id\":$SCID,\"reason\":\"换个原因\"}" || true
+
+echo "-- 20.5 解封：封存编号 + 非空原因；同因幂等、异因 409；解封后按原流程更正 --"
+api POST "/api/v1/window-seals/$SEAL_ID/unseal" '{"reason":"馆员复核：需更正后重新签发"}' \
+  | python3 -c 'import sys,json;d=json.load(sys.stdin);print("解封:",d["effect"],d["seal"]["status_label_zh"],d["seal"]["unseal"]["reason"],d["seal"]["unseal"]["unsealed_at"])'
+api POST "/api/v1/window-seals/$SEAL_ID/unseal" '{"reason":"馆员复核：需更正后重新签发"}' \
+  | python3 -c 'import sys,json;print("同因重放:",json.load(sys.stdin)["effect"])'
+api POST "/api/v1/window-seals/$SEAL_ID/unseal" '{"reason":"异因解封"}' || true
+api POST "/api/v1/window-seals/99999/unseal" '{"reason":"编号不存在"}' || true
+
+echo "-- 20.6 更正后按当前状态签发新证书，再次封存形成新记录（旧记录证据保留）--"
+api POST "/api/v1/windows/$SIDW/readings" '{"reading_id":"x","revision":1,"measured_at":"2026-10-01T00:05:00Z","temperature":20.1}' >/dev/null
+SCID2=$(api POST "/api/v1/windows/$SIDW/certificates/issue" '{"note":"更正后签发"}' \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')
+SEAL2=$(api POST "/api/v1/windows/$SIDW/seals" "{\"certificate_id\":$SCID2,\"reason\":\"更正后重新封存\"}")
+echo "$SEAL2" | python3 -c 'import sys,json;s=json.load(sys.stdin)["seal"];print("再次封存: effect sealed, 新编号",s["id"],"锁定证书",s["evidence"]["certificate_id"])'
+api GET "/api/v1/windows/$SIDW/seals" \
+  | python3 -c 'import sys,json;print("全部封存记录:",[(s["id"],s["status"],s["evidence"]["certificate_id"]) for s in json.load(sys.stdin)])'
+
+echo "-- 20.7 拒绝路径：快照与当前状态不一致 409（不留记录）；窗口/证书不存在 404；证书他窗 422；空原因 422 --"
+# 先解封以便制造不一致场景
+SEAL2_ID=$(echo "$SEAL2" | python3 -c 'import sys,json;print(json.load(sys.stdin)["seal"]["id"])')
+api POST "/api/v1/window-seals/$SEAL2_ID/unseal" '{"reason":"演示不一致拒绝"}' >/dev/null
+api POST "/api/v1/windows/$SIDW/readings" '{"reading_id":"y","revision":1,"measured_at":"2026-10-01T00:15:00Z","temperature":20.2}' >/dev/null
+api POST "/api/v1/windows/$SIDW/seals" "{\"certificate_id\":$SCID2,\"reason\":\"旧快照封存\"}" || true
+api POST "/api/v1/windows/99999/seals" "{\"certificate_id\":$SCID2,\"reason\":\"窗口不存在\"}" || true
+api POST "/api/v1/windows/$SIDW/seals" '{"certificate_id":99999,"reason":"证书不存在"}' || true
+api POST "/api/v1/windows/1/seals" "{\"certificate_id\":$SCID2,\"reason\":\"他窗证书\"}" || true
+api POST "/api/v1/windows/$SIDW/seals" "{\"certificate_id\":$SCID2,\"reason\":\"   \"}" || true

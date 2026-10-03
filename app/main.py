@@ -46,6 +46,11 @@ from .schemas import (
     VerificationResultOut,
     WindowCreate,
     WindowOut,
+    WindowSealOut,
+    WindowSealResponse,
+    WindowSealSubmit,
+    WindowUnsealResponse,
+    WindowUnsealSubmit,
 )
 
 
@@ -66,7 +71,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="博物馆展柜温度暴露审定服务",
-    version="1.9.0",
+    version="1.10.0",
     description=(
         "对展柜在给定审定窗口内的温度读数进行暴露审定："
         "输出正常/超限/未知区段与最长连续超限时长，"
@@ -97,7 +102,16 @@ app = FastAPI(
         "是否仍为所属窗口最新未撤销版本（已撤销或被新版本替代须说明原因，"
         "可信历史包不等于当前可用）；签名密钥可在本地轮换（新包用新密钥，"
         "旧包凭保留的历史公钥核验，重启后结果一致），字段篡改、未知密钥、"
-        "无对应证书或快照摘要不符均明确拒绝，核验不改变业务状态。"
+        "无对应证书或快照摘要不符均明确拒绝，核验不改变业务状态；"
+        "馆员完成窗口审定后可凭窗口标识、所见当前证书标识与非空原因封存窗口："
+        "同一写事务确认该证书仍为最新未撤销版本且其不可变快照（规则、活动"
+        "读数、有效故障时段、审定结果）与当前状态一致，不符拒绝且不留记录；"
+        "封存证据（快照副本与 SHA-256 摘要）不可改，封存期间窗口只读"
+        "（拒绝读数提交/批量补传/作废、故障登记或撤回、规则修订与新证书签发，"
+        "原查询、核验与证书撤销照常可用）；凭封存编号与非空原因解封后可按"
+        "原流程更正并再次封存形成新记录；同证书同原因重试幂等、异内容冲突，"
+        "解封同因重试幂等、异因冲突；封存证书后来被撤销时查询显示其已非"
+        "当前可用，但封存证据不变。"
     ),
     lifespan=lifespan,
 )
@@ -387,6 +401,95 @@ def withdraw_fault_period(
         evaluation = services.compute_evaluation(conn, win)
         return {"effect": effect, "fault_period": fault,
                 "current_evaluation": evaluation}
+
+
+# ---------------------------------------------------------------- 窗口封存 / 解封
+
+@app.post(
+    "/api/v1/windows/{window_id}/seals",
+    response_model=WindowSealResponse,
+    status_code=status.HTTP_201_CREATED,
+    tags=["window-seals"],
+)
+def seal_window(
+    window_id: int,
+    payload: WindowSealSubmit,
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> dict[str, Any]:
+    """馆员完成窗口审定后封存窗口（凭所见当前证书标识 + 非空原因）。
+
+    封存须在同一写事务内确认该证书仍为窗口**最新未撤销版本**，且其不可变
+    快照中的规则、活动读数、有效故障时段和审定结果与**当前状态一致**；
+    任一不符 -> 409，拒绝且不留记录。返回封存编号、封存原因、封存时间与
+    封存证据（证书标识/版本/结论 + 不可变快照副本及 SHA-256 摘要），
+    证据内容封存后不可改。
+
+    封存期间拒绝该窗口的读数提交、批量补传、作废、故障登记或撤回、规则
+    修订及新证书签发（均 409）；原查询、核验与证书撤销照常可用。封存期间
+    同证书同原因重试 -> 幂等返回原记录；异内容（异证书或异原因）-> 409。
+    证书不存在 -> 404；证书不属于该窗口 -> 422；空原因 -> 422。
+    """
+    with write_transaction(conn):
+        effect, seal = services.seal_window(conn, window_id, payload)
+        return {"effect": effect, "seal": seal}
+
+
+@app.get(
+    "/api/v1/windows/{window_id}/seals",
+    response_model=list[WindowSealOut],
+    tags=["window-seals"],
+)
+def list_window_seals(
+    window_id: int, conn: sqlite3.Connection = Depends(get_conn)
+) -> list[dict[str, Any]]:
+    """该窗口全部封存记录（含已解封），按封存编号升序。
+
+    列表项含不可改的封存证据与解封信息，但不含引用证书完整对象；
+    封存期间该查询照常可用。
+    """
+    with read_transaction(conn):
+        return services.list_window_seals(conn, window_id)
+
+
+@app.get(
+    "/api/v1/window-seals/{seal_id}",
+    response_model=WindowSealOut,
+    tags=["window-seals"],
+)
+def get_window_seal(
+    seal_id: int, conn: sqlite3.Connection = Depends(get_conn)
+) -> dict[str, Any]:
+    """按封存编号查询：返回封存证据（不可改）与引用证书的当前状态。
+
+    封存证书后来被撤销或被新版本替代时，`certificate_current_now=false`，
+    `certificate.revoked=true`，查询明确显示其已非当前可用，但封存证据
+    （快照副本与摘要）保持不变。封存编号不存在 -> 404。
+    """
+    with read_transaction(conn):
+        return services.get_seal(conn, seal_id)
+
+
+@app.post(
+    "/api/v1/window-seals/{seal_id}/unseal",
+    response_model=WindowUnsealResponse,
+    status_code=status.HTTP_201_CREATED,
+    tags=["window-seals"],
+)
+def unseal_window(
+    seal_id: int,
+    payload: WindowUnsealSubmit,
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> dict[str, Any]:
+    """凭封存编号 + 非空原因解封窗口。
+
+    解封只置状态并固化解封原因与时间，封存证据保留；解封后可按原流程
+    更正（读数提交、故障登记/撤回、规则修订、重新签发等），并可再次封存
+    形成新记录。相同原因重复解封 -> 幂等返回原记录（解封时间不变）；
+    已解封但原因不同 -> 409；封存编号不存在 -> 404；空原因 -> 422。
+    """
+    with write_transaction(conn):
+        effect, seal = services.unseal_window(conn, seal_id, payload)
+        return {"effect": effect, "seal": seal}
 
 
 # ---------------------------------------------------------------- 签发

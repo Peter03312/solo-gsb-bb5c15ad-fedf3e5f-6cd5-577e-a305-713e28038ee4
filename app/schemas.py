@@ -386,6 +386,8 @@ class WindowOut(BaseModel):
         None, description="窗口详情中给出的当前可用证书完整内容（列表端点不返回）；无则为 null")
     active_fault_periods: Optional[list[FaultPeriodOut]] = Field(
         None, description="窗口详情中给出当前有效（未撤回）仪器故障时段（按起点升序）；列表端点不返回")
+    active_seal: Optional["WindowSealOut"] = Field(
+        None, description="窗口详情中给出的当前活跃封存记录（列表端点不返回）；未封存为 null")
 
 
 class ReadingSubmitResponse(BaseModel):
@@ -469,6 +471,91 @@ class CertificateRevokeResponse(BaseModel):
     certificate: CertificateOut = Field(..., description="撤销后的证书（含撤销信息；快照原样）")
     current_certificate: Optional[CertificateOut] = Field(
         None, description="该窗口当前可用证书：仅最新签发版本未撤销时存在，否则为 null")
+
+
+# ------------------------------------------------------------ 窗口封存
+
+class WindowSealSubmit(BaseModel):
+    """封存窗口：凭所见当前证书标识 + 非空原因（窗口标识在路径中给出）。
+
+    - 封存须在同一写事务确认该证书仍为所属窗口最新未撤销版本（当前可用
+      证书），且其不可变快照中的规则、活动读数、有效故障时段与审定结果
+      与当前状态一致；不符则拒绝（409）且不留记录；
+    - 窗口已封存时：同证书同原因重试 -> 幂等返回原记录；异内容 -> 409；
+    - 证书不存在 -> 404；证书不属于该窗口 -> 422；原因为空或只含空白 -> 422。
+    """
+
+    certificate_id: int = Field(..., ge=1,
+                                description="馆员所见的窗口当前可用证书标识（主键）")
+    reason: str = Field(..., min_length=1, max_length=500,
+                        description="封存原因（非空，不能只含空白字符）")
+
+    @field_validator("reason")
+    @classmethod
+    def _non_blank(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("封存原因不能为空（不能只含空白字符）")
+        return v
+
+
+class WindowUnsealSubmit(BaseModel):
+    """解封窗口：凭封存编号（路径）+ 非空原因。
+
+    - 解封后窗口可按原流程更正（读数/作废/故障/规则/签发恢复可用）；
+    - 已解封记录以相同原因重试 -> 幂等（返回原记录，解封时间不变）；
+      以不同原因重试 -> 409；封存编号不存在 -> 404；
+      原因为空或只含空白 -> 422。
+    """
+
+    reason: str = Field(..., min_length=1, max_length=500,
+                        description="解封原因（非空，不能只含空白字符）")
+
+    @field_validator("reason")
+    @classmethod
+    def _non_blank(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("解封原因不能为空（不能只含空白字符）")
+        return v
+
+
+class UnsealInfoOut(BaseModel):
+    """解封信息：封存记录未解封时为 null。"""
+
+    reason: str = Field(..., description="解封原因")
+    unsealed_at: str = Field(..., description="解封操作时间（UTC）")
+
+
+class WindowSealOut(BaseModel):
+    """一条窗口封存记录（证据不可变；证书当前可用性为查询时核对结果）。"""
+
+    seal_no: str = Field(..., description="封存编号（服务端生成，全局唯一）")
+    window_id: int
+    certificate_id: int = Field(..., description="封存时固化的证书标识")
+    certificate_version: int = Field(..., description="封存时固化的证书版本")
+    verdict: str = Field(..., description="封存时固化的证书结论")
+    verdict_label_zh: str
+    reason: str = Field(..., description="封存原因")
+    status: str = Field(..., description="sealed | unsealed")
+    status_label_zh: str = Field(..., description="封存中 | 已解封")
+    sealed_at: str = Field(..., description="封存时间（UTC）")
+    unseal: Optional[UnsealInfoOut] = Field(
+        None, description="解封信息（原因与解封时间）；未解封为 null")
+    evidence: dict[str, Any] = Field(
+        ..., description="封存证据（规则/活动读数/有效故障时段/审定结果），一经落库不可改")
+    certificate_revoked: bool = Field(
+        ..., description="查询时核对：封存证书是否已撤销（撤销不影响封存证据）")
+    certificate_is_current: bool = Field(
+        ..., description="查询时核对：封存证书是否仍为所属窗口最新未撤销版本（当前可用）")
+
+
+class WindowSealResponse(BaseModel):
+    effect: str = Field(..., description="sealed | idempotent")
+    seal: WindowSealOut
+
+
+class WindowUnsealResponse(BaseModel):
+    effect: str = Field(..., description="unsealed | idempotent")
+    seal: WindowSealOut
 
 
 # ------------------------------------------------------------ 修订影响报告

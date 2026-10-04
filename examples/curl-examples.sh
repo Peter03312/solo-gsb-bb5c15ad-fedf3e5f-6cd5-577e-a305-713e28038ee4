@@ -561,3 +561,97 @@ echo "-- 19.10 证书不存在出包 -> 404；包格式不受支持 -> 422（无
 api POST /api/v1/certificates/99999/verification-package || true
 echo "$BUNDLE" | python3 -c "import sys,json;p=json.load(sys.stdin);p['format']='bad/format';print(json.dumps(p,ensure_ascii=False))" \
   | { read -r BADFMT; api POST /api/v1/verification-packages/verify "$BADFMT"; } || true
+
+echo "== 20. 窗口封存与解封（窗口标识 + 所见当前证书标识 + 非空原因）=="
+# 满覆盖合格窗口（5 分钟、间隔 60s、温度 20.0）并签发
+S1=$(api POST /api/v1/windows '{
+  "name": "展柜S1-封存", "start_at": "2026-10-01T00:00:00Z", "end_at": "2026-10-01T00:05:00Z",
+  "allowed_temp_min": 18.0, "allowed_temp_max": 22.0,
+  "max_continuous_exceed_seconds": 300, "max_sample_interval_seconds": 120
+}' | python3 -c "import sys,json;print(json.load(sys.stdin)['id'])")
+for m in 0 1 2 3 4 5; do
+  api POST "/api/v1/windows/$S1/readings" \
+    "{\"reading_id\":\"r-$m\",\"revision\":1,\"measured_at\":\"2026-10-01T00:0$m:00Z\",\"temperature\":20.0}" >/dev/null
+done
+SC1=$(api POST "/api/v1/windows/$S1/certificates/issue" '{"note":"审定完成"}' \
+  | python3 -c "import sys,json;print(json.load(sys.stdin)['id'])")
+
+echo "-- 20.1 封存：凭窗口标识 + 所见当前证书标识 + 非空原因；返回编号、证书、原因、时间与不可变证据 --"
+SEAL=$(api POST "/api/v1/windows/$S1/seals" \
+  "{\"certificate_id\":$SC1,\"reason\":\"窗口审定完成，封存备查\"}")
+echo "$SEAL" | python3 -m json.tool
+SEAL_NO=$(echo "$SEAL" | python3 -c "import sys,json;print(json.load(sys.stdin)['seal']['seal_no'])")
+
+echo "-- 20.2 同证书同原因重试 -> 幂等（返回原记录，编号/时间不变，不产生新记录）--"
+api POST "/api/v1/windows/$S1/seals" \
+  "{\"certificate_id\":$SC1,\"reason\":\"窗口审定完成，封存备查\"}" \
+  | python3 -c "import sys,json;d=json.load(sys.stdin);print('effect:',d['effect'],'seal_no:',d['seal']['seal_no'])"
+
+echo "-- 20.3 异内容冲突（同窗口异原因）-> 409 --"
+api POST "/api/v1/windows/$S1/seals" \
+  "{\"certificate_id\":$SC1,\"reason\":\"另一个封存原因\"}" || true
+
+echo "-- 20.4 封存期间拒绝变更：读数提交/批量补传/作废/故障登记/规则修订/新证书签发 -> 均 409 --"
+api POST "/api/v1/windows/$S1/readings" \
+  '{"reading_id":"x","revision":1,"measured_at":"2026-10-01T00:02:30Z","temperature":20.5}' || true
+api POST "/api/v1/windows/$S1/readings/batch" \
+  '{"readings":[{"reading_id":"y","revision":1,"measured_at":"2026-10-01T00:02:30Z","temperature":20.5}]}' || true
+api POST "/api/v1/windows/$S1/readings/r-2/void" '{"revision":2,"reason":"误采"}' || true
+api POST "/api/v1/windows/$S1/fault-periods" \
+  '{"fault_id":"f-x","start_at":"2026-10-01T00:01:00Z","end_at":"2026-10-01T00:02:00Z","reason":"漂移"}' || true
+api POST "/api/v1/windows/$S1/rule-revisions" \
+  '{"revision":2,"allowed_temp_min":18.0,"allowed_temp_max":19.5,"max_continuous_exceed_seconds":300,"max_sample_interval_seconds":120,"reason":"换季"}' || true
+api POST "/api/v1/windows/$S1/certificates/issue" '{"note":"封存期间尝试签发"}' || true
+
+echo "-- 20.5 封存期间查询/核验/证书撤销照常；撤销后查询显示已非当前可用，封存证据不变 --"
+api GET "/api/v1/windows/$S1" \
+  | python3 -c "import sys,json;d=json.load(sys.stdin);print('active_seal:',d['active_seal']['seal_no'],d['active_seal']['status'])"
+api POST "/api/v1/certificates/$SC1/verification-package" \
+  | python3 -c "import sys,json;print('核验包照常出具, key_id:',json.load(sys.stdin)['key_id'][:40],'...')"
+api POST "/api/v1/certificates/$SC1/revocation" '{"reason":"封存后发现签发依据有误"}' >/dev/null
+api GET "/api/v1/seals/$SEAL_NO" \
+  | python3 -c "import sys,json;d=json.load(sys.stdin);print('certificate_revoked:',d['certificate_revoked'],'certificate_is_current:',d['certificate_is_current']);print('证据不变: 读数条数',len(d['evidence']['readings']),'结论',d['evidence']['evaluation']['verdict'])"
+
+echo "-- 20.6 解封：凭封存编号 + 非空原因；保留解封原因与时间，解封后可按原流程更正 --"
+api POST "/api/v1/seals/$SEAL_NO/unseal" '{"reason":"复核确认需更正读数，解封处理"}' \
+  | python3 -c "import sys,json;d=json.load(sys.stdin);s=d['seal'];print('effect:',d['effect'],'status:',s['status']);print('unseal:',s['unseal'])"
+echo "-- 20.7 解封同因重试幂等、异因 409；编号不存在 404 --"
+api POST "/api/v1/seals/$SEAL_NO/unseal" '{"reason":"复核确认需更正读数，解封处理"}' \
+  | python3 -c "import sys,json;d=json.load(sys.stdin);print('effect:',d['effect'],'unsealed_at 不变:',d['seal']['unseal']['unsealed_at'])"
+api POST "/api/v1/seals/$SEAL_NO/unseal" '{"reason":"另一个解封原因"}' || true
+api POST "/api/v1/seals/SEAL-GHOST/unseal" '{"reason":"解封"}' || true
+
+echo "-- 20.8 解封后更正（读数修订）并重新签发 -> 可再次封存（新记录、新编号）--"
+api POST "/api/v1/windows/$S1/readings" \
+  '{"reading_id":"r-2","revision":2,"measured_at":"2026-10-01T00:02:00Z","temperature":20.6}' >/dev/null
+SC2=$(api POST "/api/v1/windows/$S1/certificates/issue" '{"note":"更正后重签"}' \
+  | python3 -c "import sys,json;print(json.load(sys.stdin)['id'])")
+api POST "/api/v1/windows/$S1/seals" "{\"certificate_id\":$SC2,\"reason\":\"更正完成，再次封存\"}" \
+  | python3 -c "import sys,json;d=json.load(sys.stdin);s=d['seal'];print('effect:',d['effect'],'新编号:',s['seal_no'],'证书版本:',s['certificate_version'])"
+echo "窗口全部封存记录（一条已解封 + 一条封存中）："
+api GET "/api/v1/windows/$S1/seals" \
+  | python3 -c "import sys,json;[print(' ',s['seal_no'],s['status'],s['status_label_zh'],'证书',s['certificate_id']) for s in json.load(sys.stdin)]"
+
+echo "-- 20.9 封存校验：证书非当前可用/快照与当前状态不一致 -> 409 且不留记录 --"
+# 另一窗口：签发后改读数 -> 快照与当前状态不一致，封存被拒且不留记录
+S2=$(api POST /api/v1/windows '{
+  "name": "展柜S2-封存校验", "start_at": "2026-10-01T00:00:00Z", "end_at": "2026-10-01T00:05:00Z",
+  "allowed_temp_min": 18.0, "allowed_temp_max": 22.0,
+  "max_continuous_exceed_seconds": 300, "max_sample_interval_seconds": 120
+}' | python3 -c "import sys,json;print(json.load(sys.stdin)['id'])")
+for m in 0 1 2 3 4 5; do
+  api POST "/api/v1/windows/$S2/readings" \
+    "{\"reading_id\":\"r-$m\",\"revision\":1,\"measured_at\":\"2026-10-01T00:0$m:00Z\",\"temperature\":20.0}" >/dev/null
+done
+SD1=$(api POST "/api/v1/windows/$S2/certificates/issue" '{"note":"首签"}' \
+  | python3 -c "import sys,json;print(json.load(sys.stdin)['id'])")
+api POST "/api/v1/windows/$S2/readings" \
+  '{"reading_id":"r-2","revision":2,"measured_at":"2026-10-01T00:02:00Z","temperature":25.0}' >/dev/null
+api POST "/api/v1/windows/$S2/seals" "{\"certificate_id\":$SD1,\"reason\":\"尝试封存\"}" || true
+echo "被拒后不留记录（应为空列表）："
+api GET "/api/v1/windows/$S2/seals"
+# 重新签发（快照与当前一致）后即可封存
+SD2=$(api POST "/api/v1/windows/$S2/certificates/issue" '{"note":"更正后重签"}' \
+  | python3 -c "import sys,json;print(json.load(sys.stdin)['id'])")
+api POST "/api/v1/windows/$S2/seals" "{\"certificate_id\":$SD2,\"reason\":\"更正完成，封存\"}" \
+  | python3 -c "import sys,json;d=json.load(sys.stdin);print('effect:',d['effect'],'seal_no:',d['seal']['seal_no'])"

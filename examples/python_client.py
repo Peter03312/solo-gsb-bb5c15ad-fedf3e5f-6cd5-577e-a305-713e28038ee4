@@ -42,6 +42,14 @@
      字段篡改、未知密钥、无对应证书、快照摘要不符均明确拒绝，核验只读；
      签名密钥可本地轮换（新包用新密钥，旧包凭保留的历史公钥核验，
      重启后结果一致）。
+ 12) 窗口封存与解封：凭窗口标识 + 所见当前证书标识 + 非空原因封存
+     （同一写事务确认证书仍为最新未撤销版本且快照与当前状态一致，不符
+     拒绝且不留记录）；封存返回编号、证书、原因与时间，证据不可改；
+     封存期间拒绝该窗口的读数提交/批量补传/作废/故障登记或撤回/规则修订/
+     新证书签发（查询、核验与证书撤销照常）；同证书同原因重试幂等、
+     异内容冲突；凭封存编号 + 非空原因解封后可按原流程更正（解封同因
+     重试幂等、异因冲突），已解封窗口可再次封存形成新记录；封存证书
+     后来被撤销时查询显示已非当前可用，封存证据不变。
 """
 from __future__ import annotations
 
@@ -164,6 +172,23 @@ def withdraw_fault(wid, fid, reason):
 def list_faults(wid, active_only=False):
     q = "?active_only=true" if active_only else ""
     return call("GET", f"/api/v1/windows/{wid}/fault-periods{q}")
+
+
+def seal_window(wid, cid, reason):
+    return call("POST", f"/api/v1/windows/{wid}/seals",
+                {"certificate_id": cid, "reason": reason})
+
+
+def unseal_window(seal_no, reason):
+    return call("POST", f"/api/v1/seals/{seal_no}/unseal", {"reason": reason})
+
+
+def get_seal(seal_no):
+    return call("GET", f"/api/v1/seals/{seal_no}")
+
+
+def list_window_seals(wid):
+    return call("GET", f"/api/v1/windows/{wid}/seals")
 
 
 def item(rid, rev, minute, temp):
@@ -927,10 +952,124 @@ def verification_package_demo() -> None:
     print("核验全程只读：证书版本、撤销状态与快照均未因核验而改变")
 
 
+def seal_demo() -> None:
+    """窗口封存与解封：封存校验、封存期间拒绝变更、幂等/冲突、解封更正、再封存。"""
+    show("窗口封存：凭窗口标识 + 所见当前证书标识 + 非空原因封存")
+    # 满覆盖合格窗口（5 分钟、间隔 60s、温度 20.0）并签发
+    wid = create_window("展柜S-封存", 5, max_exceed=300, max_gap=120)
+    for m in range(6):
+        assert submit(wid, f"r{m}", 1, m, 20.0)[0] == 201
+    cert = call("POST", f"/api/v1/windows/{wid}/certificates/issue",
+                {"note": "审定完成"})[1]
+
+    # 封存：返回编号、证书、原因、时间与不可变证据
+    code, r = seal_window(wid, cert["id"], "窗口审定完成，封存备查")
+    assert code == 201 and r["effect"] == "sealed", r
+    s = r["seal"]
+    seal_no = s["seal_no"]
+    print(f"封存成功: {seal_no}  证书 {s['certificate_id']} v{s['certificate_version']} "
+          f"{s['verdict_label_zh']}  状态 {s['status_label_zh']}")
+    assert s["reason"] == "窗口审定完成，封存备查" and s["unseal"] is None
+    # 证据与证书不可变快照同口径（规则/活动读数/有效故障时段/审定结果）
+    snap = cert["snapshot"]
+    assert s["evidence"]["readings"] == snap["readings"]
+    assert s["evidence"]["evaluation"] == snap["evaluation"]
+    assert s["evidence"]["window"]["rule_revision"] == 1
+    print("证据已固化：读数", len(s["evidence"]["readings"]), "条，结论",
+          s["evidence"]["evaluation"]["verdict"], "（不可变）")
+    # 窗口详情显示活跃封存
+    _, detail = call("GET", f"/api/v1/windows/{wid}")
+    assert detail["active_seal"]["seal_no"] == seal_no
+
+    # 同证书同原因重试 -> 幂等（返回原记录，不产生新记录）
+    code, r = seal_window(wid, cert["id"], "窗口审定完成，封存备查")
+    assert code == 201 and r["effect"] == "idempotent"
+    assert r["seal"]["seal_no"] == seal_no
+    assert list_window_seals(wid)[1].__len__() == 1
+    print("同证书同原因重试: idempotent（编号/时间不变，不产生新记录）")
+    # 异内容（异原因）-> 409
+    assert seal_window(wid, cert["id"], "另一个封存原因")[0] == 409
+    print("异内容重试: 409")
+
+    # 封存期间拒绝该窗口的全部变更类操作（409）；查询/核验/撤销照常
+    assert submit(wid, "x1", 1, 2, 20.5)[0] == 409
+    assert submit_batch(wid, [item("x2", 1, 3, 20.5)])[0] == 409
+    assert void(wid, "r2", 2, "误采")[0] == 409
+    assert register_fault(wid, "f-x", 1, 2, "漂移")[0] == 409
+    assert revise_rules(wid, 2, reason="换季")[0] == 409
+    code, _ = call("POST", f"/api/v1/windows/{wid}/certificates/issue",
+                   {"note": "封存期间尝试"})
+    assert code == 409
+    print("封存期间拒绝：读数提交/批量补传/作废/故障登记/规则修订/新证书签发 -> 均 409")
+    assert call("GET", f"/api/v1/windows/{wid}/evaluation")[0] == 200
+    pkg = call("POST", f"/api/v1/certificates/{cert['id']}/verification-package")[1]
+    assert verify_package(pkg)[1]["package_trusted"] is True
+    print("查询与核验包出具/核验照常可用")
+
+    # 封存证书被撤销：查询显示已非当前可用，封存证据不变
+    assert revoke_cert(cert["id"], "封存后发现签发依据有误")[0] == 201
+    _, got = get_seal(seal_no)
+    assert got["certificate_revoked"] is True
+    assert got["certificate_is_current"] is False
+    assert got["evidence"] == s["evidence"] and got["status"] == "sealed"
+    print("封存证书被撤销后：certificate_revoked=True、is_current=False，证据不变")
+
+    # 解封：凭封存编号 + 非空原因；保留解封原因与时间
+    code, r = unseal_window(seal_no, "复核确认需更正读数，解封处理")
+    assert code == 201 and r["effect"] == "unsealed"
+    assert r["seal"]["unseal"]["reason"] == "复核确认需更正读数，解封处理"
+    unsealed_at = r["seal"]["unseal"]["unsealed_at"]
+    print(f"解封成功: status={r['seal']['status_label_zh']}  解封时间 {unsealed_at}")
+    # 解封同因重试幂等、异因 409、编号不存在 404、空因 422
+    code, r = unseal_window(seal_no, "复核确认需更正读数，解封处理")
+    assert code == 201 and r["effect"] == "idempotent"
+    assert r["seal"]["unseal"]["unsealed_at"] == unsealed_at
+    assert unseal_window(seal_no, "另一个解封原因")[0] == 409
+    assert unseal_window("SEAL-GHOST", "解封")[0] == 404
+    assert unseal_window(seal_no, "   ")[0] == 422
+    print("解封同因重试幂等（时间不变）；异因 409；编号不存在 404；空因 422")
+
+    # 解封后可按原流程更正：读数修订 + 重新签发
+    assert submit(wid, "r2", 2, 2, 20.6)[0] == 201
+    cert2 = call("POST", f"/api/v1/windows/{wid}/certificates/issue",
+                 {"note": "更正后重签"})[1]
+    assert cert2["version"] == 2
+    print("解封后更正：读数修订 + 重新签发 v2 成功")
+
+    # 已解封窗口可再次封存：形成新记录（新编号）
+    code, r = seal_window(wid, cert2["id"], "更正完成，再次封存")
+    assert code == 201 and r["effect"] == "sealed"
+    seal_no2 = r["seal"]["seal_no"]
+    assert seal_no2 != seal_no
+    _, seals = list_window_seals(wid)
+    assert [x["status"] for x in seals] == ["unsealed", "sealed"]
+    print(f"再次封存成功: {seal_no2}（窗口现有 {len(seals)} 条封存记录："
+          f"一条已解封、一条封存中）")
+
+    # 封存校验拒绝路径：快照与当前状态不一致 -> 409 且不留记录
+    w2 = create_window("展柜S2-封存校验", 5, max_exceed=300, max_gap=120)
+    for m in range(6):
+        assert submit(w2, f"r{m}", 1, m, 20.0)[0] == 201
+    c_old = call("POST", f"/api/v1/windows/{w2}/certificates/issue", {"note": "首签"})[1]
+    assert submit(w2, "r2", 2, 2, 25.0)[0] == 201  # 签发后状态变化
+    code, err = seal_window(w2, c_old["id"], "尝试封存")
+    assert code == 409 and "不一致" in err["detail"]
+    assert list_window_seals(w2)[1] == []
+    print("签发后状态变化再封存: 409（快照与当前状态不一致），不留记录")
+    # 证书已撤销/非最新版 -> 409；证书不存在 -> 404；不属于该窗口 -> 422；空原因 -> 422
+    c_new = call("POST", f"/api/v1/windows/{w2}/certificates/issue", {"note": "重签"})[1]
+    assert seal_window(w2, c_old["id"], "封存旧版")[0] == 409
+    assert seal_window(w2, 99999, "封存")[0] == 404
+    assert seal_window(w2, cert2["id"], "封存")[0] == 422
+    assert seal_window(w2, c_new["id"], "  ")[0] == 422
+    print("非当前可用证书 409；证书不存在 404；证书不属于该窗口 422；空原因 422")
+
+
 if __name__ == "__main__":
     main()
     fault_period_demo()
     handover_demo()
     cross_window_demo()
     verification_package_demo()
+    seal_demo()
     print("\n全部示例执行完成 ✔")

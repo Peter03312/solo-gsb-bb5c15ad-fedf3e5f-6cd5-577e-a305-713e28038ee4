@@ -173,6 +173,32 @@ CREATE TABLE IF NOT EXISTS signing_keys (
     retired_at TEXT,                           -- 轮换停用时间（仅 retired 行）
     retired_reason TEXT                       -- 轮换原因（仅 retired 行；留痕）
 );
+
+-- 窗口封存：馆员完成窗口审定后，凭窗口标识 + 所见当前证书标识 + 非空原因
+-- 封存窗口。封存须在同一写事务确认该证书仍为最新未撤销版本，且其不可变
+-- 快照中的规则、活动读数、有效故障时段与审定结果与当前状态一致（不符则
+-- 拒绝且不留记录）。封存证据（evidence_json：规则/活动读数/有效故障时段/
+-- 审定结果）一经落库不可改；封存期间拒绝该窗口的读数提交、批量补传、
+-- 作废、故障登记或撤回、规则修订及新证书签发（查询、核验与证书撤销照常）。
+-- 凭封存编号 + 非空原因解封（保留解封原因与时间）后可按原流程更正；
+-- 已解封窗口可再次封存并形成新记录（同一窗口至多一条 sealed 活跃封存）。
+CREATE TABLE IF NOT EXISTS window_seals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    seal_no TEXT NOT NULL UNIQUE,            -- 封存编号（服务端生成，全局唯一）
+    window_id INTEGER NOT NULL REFERENCES windows(id),
+    certificate_id INTEGER NOT NULL REFERENCES certificates(id),
+    certificate_version INTEGER NOT NULL,    -- 封存时固化的证书版本
+    verdict TEXT NOT NULL,                   -- 封存时固化的证书结论
+    reason TEXT NOT NULL,                    -- 封存原因（非空）
+    evidence_json TEXT NOT NULL,             -- 封存证据（不可变）
+    status TEXT NOT NULL DEFAULT 'sealed',   -- sealed | unsealed
+    unsealed_reason TEXT,                    -- 解封原因（仅 unsealed 行）
+    unsealed_at TEXT,                        -- 解封操作时间（仅 unsealed 行）
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))  -- 封存时间
+);
+
+CREATE INDEX IF NOT EXISTS idx_window_seals_window
+    ON window_seals(window_id, status);
 """
 
 # 旧库迁移：CREATE TABLE IF NOT EXISTS 不会给已存在的表补列，
